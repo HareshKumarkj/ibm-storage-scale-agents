@@ -1,4 +1,4 @@
-"""Provisioning Agent for IBM Storage Scale fileset operations."""
+"""ILM (Information Lifecycle Management) Agent for IBM Storage Scale policy operations."""
 
 import logging
 from pathlib import Path
@@ -6,8 +6,8 @@ from typing import List
 
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import create_react_agent
 
+from src.ilm_agent.workflow_graph import create_ilm_workflow_graph, create_initial_state
 from src.utils.common import (
     create_langchain_tool_no_confirmation_simple,
     create_langchain_tool_with_confirmation_simple,
@@ -16,25 +16,25 @@ from src.utils.common import (
     setup_logging,
 )
 from src.utils.constants import (
-    PROVISIONING_AGENT_SYSTEM_PROMPT,
-    PROVISIONING_ALLOWED_TOOLS,
-    PROVISIONING_CONFIRMATION_REQUIRED_TOOLS,
+    ILM_AGENT_SYSTEM_PROMPT,
+    ILM_ALLOWED_TOOLS,
+    ILM_CONFIRMATION_REQUIRED_TOOLS,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class ProvisioningAgent:
-    """Agent for managing IBM Storage Scale filesets and snapshots."""
+class ILMAgent:
+    """Agent for managing IBM Storage Scale ILM policies."""
 
     def __init__(self, config_path: str = "config/agents_settings.ini"):
         self.config = load_agent_config(Path(config_path))
 
-        # Setup logging from config — file_path is the provisioning agent log
+        # Setup logging from config — use ilm_file_path if present, else fall back to file_path
         logging_config = self.config["logging"] if "logging" in self.config else {}
         setup_logging(
             log_level=logging_config.get("level", "INFO"),
-            log_file=logging_config.get("file_path", "logs/provisioning_agent.log"),
+            log_file=logging_config.get("ilm_file_path", logging_config.get("file_path", "logs/ilm_agent.log")),
             log_format=logging_config.get("format", "json"),
             max_bytes=int(logging_config.get("max_bytes", "10485760")),
             backup_count=int(logging_config.get("backup_count", "5")),
@@ -52,14 +52,14 @@ class ProvisioningAgent:
 
     async def initialize(self):
         """Initialize the agent and connect to MCP server."""
-        logger.info(f"Allowed tools: {', '.join(PROVISIONING_ALLOWED_TOOLS)}")
+        logger.info(f"Allowed tools: {', '.join(ILM_ALLOWED_TOOLS)}")
 
         await self.mcp_client._ensure_session()
         logger.info("MCP server connected")
 
         logger.info("Configuring tools")
-        for tool_name in PROVISIONING_ALLOWED_TOOLS:
-            if tool_name in PROVISIONING_CONFIRMATION_REQUIRED_TOOLS:
+        for tool_name in ILM_ALLOWED_TOOLS:
+            if tool_name in ILM_CONFIRMATION_REQUIRED_TOOLS:
                 tool = create_langchain_tool_with_confirmation_simple(tool_name, self.mcp_client)
                 logger.debug(f"Configured tool: {tool_name} (with confirmation)")
             else:
@@ -69,14 +69,13 @@ class ProvisioningAgent:
             self.tools.append(tool)
 
         memory = MemorySaver()
-        self.agent_executor = create_react_agent(
-            self.llm,
-            self.tools,
-            checkpointer=memory,
-        )
+        
+        # Create custom workflow graph with enforced sequencing
+        self.agent_executor = create_ilm_workflow_graph(self.llm, self.tools)
+        self.agent_executor = self.agent_executor.compile(checkpointer=memory)
 
-        self.system_prompt = PROVISIONING_AGENT_SYSTEM_PROMPT
-        logger.info("Agent initialized")
+        self.system_prompt = ILM_AGENT_SYSTEM_PROMPT
+        logger.info("ILM Agent initialized with custom workflow graph")
 
     async def cleanup(self):
         """Cleanup resources."""
@@ -90,3 +89,5 @@ class ProvisioningAgent:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.cleanup()
+
+# Made with Bob

@@ -1,13 +1,14 @@
 [project]
 name = "scale-agents"
 version = "0.1.0"
-description = "IBM Storage Scale Provisioning Agent with LangChain"
+description = "IBM Storage Scale Agents (Provisioning + ILM) with LangChain"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "langchain>=1.2.3",
     "langchain-community>=0.4.1",
     "langchain-ollama>=1.0.1",
+    "langchain-openai>=0.3.0",
     "langgraph>=1.0.5",
     "httpx>=0.28.1",
 ]

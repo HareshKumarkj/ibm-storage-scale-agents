@@ -1,9 +1,11 @@
 """Common utility functions for agent configuration and MCP setup."""
 
 import asyncio
+import base64
 import configparser
 import json
 import logging
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -29,6 +31,122 @@ def get_tool_execution_semaphore():
     if _TOOL_EXECUTION_SEMAPHORE is None:
         _TOOL_EXECUTION_SEMAPHORE = asyncio.Semaphore(1)
     return _TOOL_EXECUTION_SEMAPHORE
+
+
+def decode_policy_contents(base64_content: str) -> str:
+    """Decode base64-encoded policy contents to plain text.
+
+    Args:
+        base64_content: Base64-encoded policy content
+
+    Returns:
+        Decoded plain text policy content
+    """
+    try:
+        decoded_bytes = base64.b64decode(base64_content, validate=True)
+        return decoded_bytes.decode("utf-8")
+    except Exception as e:
+        # If decoding fails, return as-is (might already be plain text)
+        return base64_content
+
+
+def process_policy_contents(tool_name: str, filtered_kwargs: dict, logger: logging.Logger) -> None:
+    """Process policy_contents parameter: decode if needed, sanitize, and base64-encode.
+    
+    This is a shared helper for both test_policy and update_policy tools.
+    Modifies filtered_kwargs in place.
+    
+    Args:
+        tool_name: Name of the tool being called
+        filtered_kwargs: Dictionary of tool arguments (modified in place)
+        logger: Logger instance for output
+    """
+    if "policy_contents" not in filtered_kwargs:
+        return
+        
+    raw = filtered_kwargs["policy_contents"]
+    if not isinstance(raw, str):
+        return
+    
+    # Check if already valid base64 — if so, decode to sanitize
+    try:
+        decoded_bytes = base64.b64decode(raw, validate=True)
+        # It was base64 — decode to plain text for sanitization
+        raw = decoded_bytes.decode("utf-8")
+    except Exception:
+        pass  # raw is already plain text
+    
+    # Sanitize common LLM syntax mistakes for Scale policy rules
+    raw = sanitize_policy_syntax(raw)
+    
+    # Encode to base64 for MCP transmission
+    encoded = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
+    logger.info(f"Policy rule for {tool_name} (will be base64-encoded before sending to MCP):\n{raw}")
+    filtered_kwargs["policy_contents"] = encoded
+
+
+def sanitize_policy_syntax(policy_text: str) -> str:
+    """Sanitize common LLM syntax mistakes in Scale policy rules.
+    
+    This function corrects common formatting issues that LLMs make when generating
+    IBM Storage Scale policy syntax, such as:
+    - Using double quotes instead of single quotes
+    - Incorrect DAYS() function syntax
+    - Quoted rule names
+    
+    Args:
+        policy_text: Raw policy text from LLM
+        
+    Returns:
+        Sanitized policy text with corrected syntax
+    """
+    logger = logging.getLogger(__name__)
+    original_text = policy_text
+    corrections_made = []
+    
+    # Fix literal \n escape sequences → real newlines
+    if '\\n' in policy_text:
+        policy_text = policy_text.replace('\\n', '\n')
+        corrections_made.append("Fixed escaped newlines")
+    
+    # Fix RULE "name" → RULE name (remove quotes around rule name)
+    if re.search(r'^(RULE\s+)["\'](\w+)["\']', policy_text, flags=re.MULTILINE):
+        policy_text = re.sub(r'^(RULE\s+)["\'](\w+)["\']', r'\1\2', policy_text, flags=re.MULTILINE)
+        corrections_made.append("Removed quotes from rule name")
+    
+    # Fix FROM POOL "name" → FROM POOL 'name'
+    if re.search(r'((?:FROM|TO)\s+POOL\s+)"([^"]+)"', policy_text):
+        policy_text = re.sub(r'((?:FROM|TO)\s+POOL\s+)"([^"]+)"', r"\1'\2'", policy_text)
+        corrections_made.append("Fixed pool name quotes (double → single)")
+    
+    # Fix NAME LIKE "pattern" → NAME LIKE 'pattern'
+    if re.search(r'((?:NAME|PATH_NAME)\s+LIKE\s+)"([^"]+)"', policy_text):
+        policy_text = re.sub(r'((?:NAME|PATH_NAME)\s+LIKE\s+)"([^"]+)"', r"\1'\2'", policy_text)
+        corrections_made.append("Fixed pattern quotes (double → single)")
+    
+    # Fix DAYS(CURRENT_TIMESTAMP - ACCESS_TIME) → DAYS(CURRENT_TIMESTAMP) - DAYS(ACCESS_TIME)
+    if re.search(r'DAYS\(\s*CURRENT_TIMESTAMP\s*-\s*ACCESS_TIME\s*\)', policy_text):
+        policy_text = re.sub(
+            r'DAYS\(\s*CURRENT_TIMESTAMP\s*-\s*ACCESS_TIME\s*\)',
+            'DAYS(CURRENT_TIMESTAMP) - DAYS(ACCESS_TIME)',
+            policy_text
+        )
+        corrections_made.append("Fixed DAYS() syntax for ACCESS_TIME")
+    
+    # Fix DAYS(CURRENT_TIMESTAMP - MODIFICATION_TIME) → DAYS(CURRENT_TIMESTAMP) - DAYS(MODIFICATION_TIME)
+    if re.search(r'DAYS\(\s*CURRENT_TIMESTAMP\s*-\s*MODIFICATION_TIME\s*\)', policy_text):
+        policy_text = re.sub(
+            r'DAYS\(\s*CURRENT_TIMESTAMP\s*-\s*MODIFICATION_TIME\s*\)',
+            'DAYS(CURRENT_TIMESTAMP) - DAYS(MODIFICATION_TIME)',
+            policy_text
+        )
+        corrections_made.append("Fixed DAYS() syntax for MODIFICATION_TIME")
+    
+    # Log corrections if any were made
+    if corrections_made and policy_text != original_text:
+        logger.debug(f"Policy sanitization applied: {', '.join(corrections_made)}")
+    
+    return policy_text
 
 
 def setup_logging(
@@ -334,6 +452,27 @@ def create_langchain_tool_with_confirmation_simple(tool_name: str, mcp_client: M
     """
     # Tool-specific descriptions and schemas
     tool_configs = {
+        "update_policy": {
+            "description": (
+                "Update a storage policy for an IBM Storage Scale filesystem. "
+                "Requires the filesystem name and policy_contents containing the plain-text IBM Storage Scale policy rule(s). "
+                "The agent layer will base64-encode the content automatically before sending to the MCP server."
+            ),
+            "args": {
+                "filesystem": {
+                    "type": str,
+                    "description": "The filesystem name to apply the policy to (e.g., 'fs1')",
+                },
+                "policy_contents": {
+                    "type": str,
+                    "description": (
+                        "Plain-text IBM Storage Scale RULE statements. "
+                        "Provide the policy as plain text — encoding is handled automatically."
+                    ),
+                },
+                "domain": {"type": str, "description": "Domain for authorization", "optional": True},
+            },
+        },
         "create_independent_fileset": {
             "description": "Create an INDEPENDENT fileset with its own inode space (can have snapshots)",
             "args": {
@@ -417,6 +556,10 @@ def create_langchain_tool_with_confirmation_simple(tool_name: str, mcp_client: M
 
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
+        # For update_policy: sanitize and base64-encode policy_contents
+        if tool_name == "update_policy":
+            process_policy_contents(tool_name, filtered_kwargs, logger)
+
         # Acquire semaphore to ensure sequential execution
         semaphore = get_tool_execution_semaphore()
         async with semaphore:
@@ -473,6 +616,52 @@ def create_langchain_tool_no_confirmation_simple(tool_name: str, mcp_client: MCP
     """
     # Tool-specific descriptions and schemas
     tool_configs = {
+        "test_policy": {
+            "description": (
+                "Test/validate a storage policy for an IBM Storage Scale filesystem without applying it. "
+                "Requires the filesystem name and policy_contents containing the plain-text IBM Storage Scale policy rule(s). "
+                "The agent layer will base64-encode the content automatically before sending to the MCP server."
+            ),
+            "args": {
+                "filesystem": {
+                    "type": str,
+                    "description": "The filesystem name to test the policy against (e.g., 'fs1')",
+                },
+                "policy_contents": {
+                    "type": str,
+                    "description": (
+                        "Plain-text IBM Storage Scale RULE statements. "
+                        "Provide the policy as plain text — encoding is handled automatically."
+                    ),
+                },
+                "domain": {"type": str, "description": "Domain for authorization", "optional": True},
+            },
+        },
+        "get_policy": {
+            "description": "Retrieve the current storage policy for a filesystem",
+            "args": {
+                "filesystem": {"type": str, "description": "The filesystem name (e.g., 'fs1')"},
+                "domain": {"type": str, "description": "Domain for authorization", "optional": True},
+            },
+        },
+        "list_storage_pools": {
+            "description": "List all storage pools in a filesystem",
+            "args": {
+                "filesystem": {"type": str, "description": "The filesystem name (e.g., 'fs1')"},
+                "domain": {"type": str, "description": "Domain for authorization", "optional": True},
+            },
+        },
+        "apply_policy": {
+            "description": (
+                "Execute mmapplypolicy command to run the ILM policy on a filesystem. "
+                "This applies the policy that was previously updated via update_policy. "
+                "It runs the policy engine to scan files and execute the policy rules. "
+                "The policy is read from the filesystem's metadata (set by update_policy)."
+            ),
+            "args": {
+                "filesystem": {"type": str, "description": "The filesystem name (e.g., 'fs1')"},
+            },
+        },
         "list_filesets": {
             "description": "List all filesets in a filesystem",
             "args": {
@@ -542,6 +731,10 @@ def create_langchain_tool_no_confirmation_simple(tool_name: str, mcp_client: MCP
 
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
+        # For test_policy: sanitize and base64-encode policy_contents
+        if tool_name == "test_policy":
+            process_policy_contents(tool_name, filtered_kwargs, logger)
+
         # Acquire semaphore to ensure sequential execution
         semaphore = get_tool_execution_semaphore()
         async with semaphore:
@@ -553,6 +746,15 @@ def create_langchain_tool_no_confirmation_simple(tool_name: str, mcp_client: MCP
                 result = await mcp_client.call_tool(tool_name, filtered_kwargs)
                 logger.debug(f"Result from {tool_name} (type: {type(result)})")
                 logger.debug(f"Full result: {json.dumps(result, indent=2)}")
+                
+                # Auto-decode policy_contents for get_policy tool
+                if tool_name == "get_policy" and isinstance(result, dict):
+                    if "policy_contents" in result and result["policy_contents"]:
+                        logger.debug("Decoding base64 policy_contents from get_policy response")
+                        result["policy_contents"] = decode_policy_contents(result["policy_contents"])
+                        result["decoded"] = True
+                        logger.info(f"Decoded policy for {tool_name}:\n{result['policy_contents']}")
+                
                 logger.debug(f"[SEQUENTIAL] Released execution lock for {tool_name} (success)")
                 return json.dumps(result, indent=2)
             except Exception as e:
