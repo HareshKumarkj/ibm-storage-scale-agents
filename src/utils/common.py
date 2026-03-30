@@ -41,13 +41,15 @@ def decode_policy_contents(base64_content: str) -> str:
 
     Returns:
         Decoded plain text policy content
+ 
+    Raises:
+        ValueError: If content is not valid base64 or UTF-8
     """
     try:
         decoded_bytes = base64.b64decode(base64_content, validate=True)
         return decoded_bytes.decode("utf-8")
     except Exception as e:
-        # If decoding fails, return as-is (might already be plain text)
-        return base64_content
+        raise ValueError(f"Failed to decode policy contents: {str(e)}") from e
 
 
 def process_policy_contents(tool_name: str, filtered_kwargs: dict, logger: logging.Logger) -> None:
@@ -205,6 +207,24 @@ def setup_logging(
         root_logger.addHandler(file_handler)
 
     return root_logger
+
+
+def setup_agent_logging(config: configparser.ConfigParser, log_path_key: str, default_log_path: str) -> None:
+    """Setup logging for an agent from configuration.
+
+    Args:
+        config: ConfigParser instance with agent configuration
+        log_path_key: Key to look up in logging config (e.g., 'ilm_log_path')
+        default_log_path: Default log file path if key not found
+    """
+    logging_config = config["logging"] if "logging" in config else {}
+    setup_logging(
+        log_level=logging_config.get("level", "INFO"),
+        log_file=logging_config.get(log_path_key, default_log_path),
+        log_format=logging_config.get("format", "json"),
+        max_bytes=int(logging_config.get("max_bytes", "10485760")),
+        backup_count=int(logging_config.get("backup_count", "5")),
+    )
 
 
 class MCPClient:
@@ -473,6 +493,18 @@ def create_langchain_tool_with_confirmation_simple(tool_name: str, mcp_client: M
                 "domain": {"type": str, "description": "Domain for authorization", "optional": True},
             },
         },
+        "apply_policy": {
+            "description": (
+                "Execute mmapplypolicy command to run the ILM policy on a filesystem. "
+                "This applies the policy that was previously updated via update_policy. "
+                "It runs the policy engine to scan files and execute the policy rules. "
+                "The policy is read from the filesystem's metadata (set by update_policy)."
+            ),
+            "args": {
+                "filesystem": {"type": str, "description": "The filesystem name (e.g., 'fs1')"},
+                "domain": {"type": str, "description": "Domain for authorization", "optional": True},
+            },
+        },
         "create_independent_fileset": {
             "description": "Create an INDEPENDENT fileset with its own inode space (can have snapshots)",
             "args": {
@@ -584,7 +616,12 @@ def create_langchain_tool_with_confirmation_simple(tool_name: str, mcp_client: M
 
             if approval is None or not approval.get("approved", False):
                 logger.debug(f"[SEQUENTIAL] Released execution lock for {tool_name} (cancelled)")
-                return json.dumps({"status": "cancelled", "message": f"Operation {tool_name} cancelled by user"})
+                return json.dumps({
+                    "status": "error",
+                    "isError": True,
+                    "message": f"Operation {tool_name} cancelled by user",
+                    "cancelled": True
+                })
 
             logger.info(f"Approved. Calling {tool_name} with args: {filtered_kwargs}")
             try:
@@ -649,17 +686,6 @@ def create_langchain_tool_no_confirmation_simple(tool_name: str, mcp_client: MCP
             "args": {
                 "filesystem": {"type": str, "description": "The filesystem name (e.g., 'fs1')"},
                 "domain": {"type": str, "description": "Domain for authorization", "optional": True},
-            },
-        },
-        "apply_policy": {
-            "description": (
-                "Execute mmapplypolicy command to run the ILM policy on a filesystem. "
-                "This applies the policy that was previously updated via update_policy. "
-                "It runs the policy engine to scan files and execute the policy rules. "
-                "The policy is read from the filesystem's metadata (set by update_policy)."
-            ),
-            "args": {
-                "filesystem": {"type": str, "description": "The filesystem name (e.g., 'fs1')"},
             },
         },
         "list_filesets": {

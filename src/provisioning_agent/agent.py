@@ -13,7 +13,7 @@ from src.utils.common import (
     create_langchain_tool_with_confirmation_simple,
     create_mcp_client,
     load_agent_config,
-    setup_logging,
+    setup_agent_logging,
 )
 from src.utils.constants import (
     PROVISIONING_AGENT_SYSTEM_PROMPT,
@@ -29,16 +29,7 @@ class ProvisioningAgent:
 
     def __init__(self, config_path: str = "config/agents_settings.ini"):
         self.config = load_agent_config(Path(config_path))
-
-        # Setup logging from config — file_path is the provisioning agent log
-        logging_config = self.config["logging"] if "logging" in self.config else {}
-        setup_logging(
-            log_level=logging_config.get("level", "INFO"),
-            log_file=logging_config.get("file_path", "logs/provisioning_agent.log"),
-            log_format=logging_config.get("format", "json"),
-            max_bytes=int(logging_config.get("max_bytes", "10485760")),
-            backup_count=int(logging_config.get("backup_count", "5")),
-        )
+        setup_agent_logging(self.config, "provisioning_log_path", "logs/provisioning_agent.log")
 
         llm_config = self.config["llm"]
         mcp_config = self.config["mcp"]
